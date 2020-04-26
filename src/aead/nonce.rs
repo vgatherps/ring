@@ -32,8 +32,15 @@ use core::marker::PhantomData;
 ///
 /// The user must ensure, for a particular key, that each nonce is unique.
 ///
-/// `Nonce` intentionally doesn't implement `Clone` to ensure that each one is
-/// consumed at most once.
+/// WARNING:
+/// WARNING:
+/// WARNING:
+/// I add a derive of clone to nonce so that it can be used to decrypt partial messages
+/// DO NOT CLONE THIS OUTSIDE OF THAT CONTEXT
+/// In general, I shouldn't touch the crypto libraries outside of adding partial decryption
+/// support anyways
+
+#[derive(Clone)]
 pub struct Nonce([u8; NONCE_LEN]);
 
 impl Nonce {

@@ -39,12 +39,14 @@ fn aead_aes_gcm_128() {
         &aead::AES_128_GCM,
         seal_with_key,
         open_with_key,
+        open_with_key_partial,
         test_file!("aead_aes_128_gcm_tests.txt"),
     );
     test_aead(
         &aead::AES_128_GCM,
         seal_with_less_safe_key,
         open_with_less_safe_key,
+        open_with_less_safe_key_partial,
         test_file!("aead_aes_128_gcm_tests.txt"),
     );
 }
@@ -55,12 +57,14 @@ fn aead_aes_gcm_256() {
         &aead::AES_256_GCM,
         seal_with_key,
         open_with_key,
+        open_with_key_partial,
         test_file!("aead_aes_256_gcm_tests.txt"),
     );
     test_aead(
         &aead::AES_256_GCM,
         seal_with_less_safe_key,
         open_with_less_safe_key,
+        open_with_less_safe_key_partial,
         test_file!("aead_aes_256_gcm_tests.txt"),
     );
 }
@@ -71,20 +75,23 @@ fn aead_chacha20_poly1305() {
         &aead::CHACHA20_POLY1305,
         seal_with_key,
         open_with_key,
+        open_with_key_partial,
         test_file!("aead_chacha20_poly1305_tests.txt"),
     );
     test_aead(
         &aead::CHACHA20_POLY1305,
         seal_with_less_safe_key,
         open_with_less_safe_key,
+        open_with_less_safe_key_partial,
         test_file!("aead_chacha20_poly1305_tests.txt"),
     );
 }
 
-fn test_aead<Seal, Open>(
+fn test_aead<Seal, Open, OpenP>(
     aead_alg: &'static aead::Algorithm,
     seal: Seal,
     open: Open,
+    open_partial: OpenP,
     test_file: test::File,
 ) where
     Seal: Fn(
@@ -102,6 +109,15 @@ fn test_aead<Seal, Open>(
         &'a mut [u8],
         RangeFrom<usize>,
     ) -> Result<&'a mut [u8], error::Unspecified>,
+    OpenP: for<'a> Fn(
+        &'static aead::Algorithm,
+        &[u8],
+        aead::Nonce,
+        aead::Aad<&[u8]>,
+        &'a mut [u8],
+        usize,
+        RangeFrom<usize>,
+    ) -> Result<&'a mut [u8], error::Unspecified>
 {
     test_aead_key_sizes(aead_alg);
 
@@ -212,6 +228,41 @@ fn test_aead<Seal, Open>(
             o_in_out.extend_from_slice(&ct[..]);
 
             let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+            let partial_size = ct.len() / 2;
+            if partial_size > 1 {
+                let nonce = aead::Nonce::try_assume_unique_for_key(&nonce_bytes).unwrap();
+                let mut partial_in_out = o_in_out.clone();
+
+                let o_result = open_partial(
+                    aead_alg,
+                    &key_bytes,
+                    nonce,
+                    aead::Aad::from(&aad[..]),
+                    &mut partial_in_out[0..(o_in_out.len() - partial_size)],
+                    ct.len(),
+                    *in_prefix_len..,
+                    );
+                match error {
+                    None => {
+                        // desired plaintext calculation is a little bit tricky since it requires
+                        // figuring out how much of the tag is left
+                        let ores = o_result.unwrap();
+                        let size_to_remove = if partial_size > aead_alg.tag_len() {
+                            partial_size - aead_alg.tag_len()
+                        } else {
+                            0
+                        };
+                        assert_eq!(&plaintext[..(plaintext.len() - size_to_remove)], ores);
+                    }
+                    Some(ref error) if error == "WRONG_NONCE_LENGTH" => {
+                        assert_eq!(Err(error::Unspecified), s_result);
+                        assert_eq!(Err(error::Unspecified), o_result);
+                    }
+                    Some(error) => {
+                        unreachable!("Unexpected error test case: {}", error);
+                    }
+                };
+            }
             let o_result = open(
                 aead_alg,
                 &key_bytes,
@@ -262,6 +313,19 @@ fn open_with_key<'a>(
     o_key.open_within(aad, in_out, ciphertext_and_tag)
 }
 
+fn open_with_key_partial<'a>(
+    algorithm: &'static aead::Algorithm,
+    key: &[u8],
+    nonce: aead::Nonce,
+    aad: aead::Aad<&[u8]>,
+    in_out: &'a mut [u8],
+    total_size: usize,
+    ciphertext_and_tag: RangeFrom<usize>,
+) -> Result<&'a mut [u8], error::Unspecified> {
+    let o_key: aead::OpeningKey<OneNonceSequence> = make_key(algorithm, key, nonce);
+    o_key.open_within_partial(aad, in_out, total_size, ciphertext_and_tag)
+}
+
 fn seal_with_less_safe_key(
     algorithm: &'static aead::Algorithm,
     key: &[u8],
@@ -283,6 +347,19 @@ fn open_with_less_safe_key<'a>(
 ) -> Result<&'a mut [u8], error::Unspecified> {
     let key = make_less_safe_key(algorithm, key);
     key.open_within(nonce, aad, in_out, ciphertext_and_tag)
+}
+
+fn open_with_less_safe_key_partial<'a>(
+    algorithm: &'static aead::Algorithm,
+    key: &[u8],
+    nonce: aead::Nonce,
+    aad: aead::Aad<&[u8]>,
+    in_out: &'a mut [u8],
+    total_size: usize,
+    ciphertext_and_tag: RangeFrom<usize>,
+) -> Result<&'a mut [u8], error::Unspecified> {
+    let key = make_less_safe_key(algorithm, key);
+    key.open_within_partial(nonce, aad, in_out, total_size, ciphertext_and_tag)
 }
 
 fn test_aead_key_sizes(aead_alg: &'static aead::Algorithm) {
@@ -447,6 +524,9 @@ impl OneNonceSequence {
 
 impl aead::NonceSequence for OneNonceSequence {
     fn advance(&mut self) -> Result<aead::Nonce, error::Unspecified> {
-        self.0.take().ok_or(error::Unspecified)
+        self.current()
+    }
+    fn current(&self) -> Result<aead::Nonce, error::Unspecified> {
+        self.0.clone().take().ok_or(error::Unspecified)
     }
 }

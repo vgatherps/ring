@@ -49,6 +49,9 @@ pub trait NonceSequence {
     /// sent/received under a key this way. Once `advance()` fails, it must
     /// fail for all subsequent calls.
     fn advance(&mut self) -> Result<Nonce, error::Unspecified>;
+
+    /// Returns the current nonce in the sequence, used for partial decrypting
+    fn current(&self) -> Result<Nonce, error::Unspecified>;
 }
 
 /// An AEAD key bound to a nonce sequence.
@@ -177,6 +180,111 @@ impl<N: NonceSequence> OpeningKey<N> {
             ciphertext_and_tag,
         )
     }
+
+
+    /// Like [`OpeningKey::open_in_place()`]
+    /// This only partially decrypts the ciphertext, ignores the tag, and does not validate
+    /// Useful only for speculation on partial messages.
+    ///
+    /// This DOES NOT advance the nonce sequence
+    #[inline]
+    pub fn open_in_place_partial<'in_out, A>(
+        &self,
+        aad: Aad<A>,
+        in_out: &'in_out mut [u8],
+        total_text_size: usize,
+    ) -> Result<&'in_out mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        self.open_within_partial(aad, in_out, total_text_size, 0..)
+    }
+
+    /// Like [`OpeningKey::open_within()`]
+    /// This only partially decrypts the ciphertext, ignores the tag, and does not validate
+    /// Useful only for speculation on partial messages
+    ///
+    /// This DOES NOT advance the nonce sequence
+    #[inline]
+    pub fn open_within_partial<'in_out, A>(
+        &self,
+        aad: Aad<A>,
+        in_out: &'in_out mut [u8],
+        total_text_size: usize,
+        ciphertext_and_tag: RangeFrom<usize>,
+    ) -> Result<&'in_out mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        let nonce = self.nonce_sequence.current()?;
+        open_within_partial_(&self.key, nonce, aad, in_out, total_text_size, ciphertext_and_tag)
+    }
+}
+
+
+/// Partially opens a message without validating it or decrypting the entire message
+#[inline]
+fn open_within_partial_<'in_out, A: AsRef<[u8]>>(
+    key: &UnboundKey,
+    nonce: Nonce,
+    Aad(aad): Aad<A>,
+    in_out: &'in_out mut [u8],
+    total_text_size: usize,
+    ciphertext_and_tag: RangeFrom<usize>,
+) -> Result<&'in_out mut [u8], error::Unspecified> {
+    fn open_within<'in_out>(
+        key: &UnboundKey,
+        nonce: Nonce,
+        aad: Aad<&[u8]>,
+        in_out: &'in_out mut [u8],
+        total_text_size: usize,
+        ciphertext_and_tag: RangeFrom<usize>,
+    ) -> Result<&'in_out mut [u8], error::Unspecified> {
+
+        let in_prefix_len = ciphertext_and_tag.start;
+
+        let useful_text_len = in_out
+            .len()
+            .checked_sub(in_prefix_len)
+            .ok_or(error::Unspecified)?;
+
+        if useful_text_len > total_text_size {
+            return Err(error::Unspecified);
+        }
+
+        let total_ciphertext_len = total_text_size
+            .checked_sub(TAG_LEN)
+            .ok_or(error::Unspecified)?;
+
+        let ciphertext_len = if useful_text_len > total_ciphertext_len {
+            total_ciphertext_len
+        } else {
+            useful_text_len
+        };
+
+        check_per_nonce_max_bytes(key.algorithm, ciphertext_len)?;
+        let (in_out, _) = in_out.split_at_mut(in_prefix_len + ciphertext_len);
+        // INTENTIONALLY INGORE THIS RIGHT HERE
+        let _ = (key.algorithm.open)(
+            &key.inner,
+            nonce,
+            aad,
+            in_prefix_len,
+            in_out,
+            key.cpu_features,
+        );
+        // `ciphertext_len` is also the plaintext length.
+        Ok(&mut in_out[..ciphertext_len])
+    }
+
+    open_within(
+        key,
+        nonce,
+        Aad::from(aad.as_ref()),
+        in_out,
+        total_text_size,
+        ciphertext_and_tag,
+    )
 }
 
 #[inline]
@@ -489,6 +597,45 @@ impl LessSafeKey {
         A: AsRef<[u8]>,
     {
         open_within_(&self.key, nonce, aad, in_out, ciphertext_and_tag)
+    }
+
+    /// Like [`OpeningKey::open_in_place()`], except it accepts an arbitrary nonce.
+    /// This only partially decrypts the ciphertext, ignores the tag, and does not validate
+    /// Useful only for speculation on partial messages
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[inline]
+    pub fn open_in_place_partial<'in_out, A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        in_out: &'in_out mut [u8],
+        total_text_size: usize,
+    ) -> Result<&'in_out mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        self.open_within_partial(nonce, aad, in_out, total_text_size, 0..)
+    }
+
+    /// Like [`OpeningKey::open_within()`], except it accepts an arbitrary nonce.
+    /// This only partially decrypts the ciphertext, ignores the tag, and does not validate
+    /// Useful only for speculation on partial messages
+    ///
+    /// `nonce` must be unique for every use of the key to open data.
+    #[inline]
+    pub fn open_within_partial<'in_out, A>(
+        &self,
+        nonce: Nonce,
+        aad: Aad<A>,
+        in_out: &'in_out mut [u8],
+        total_text_size: usize,
+        ciphertext_and_tag: RangeFrom<usize>,
+    ) -> Result<&'in_out mut [u8], error::Unspecified>
+    where
+        A: AsRef<[u8]>,
+    {
+        open_within_partial_(&self.key, nonce, aad, in_out, total_text_size, ciphertext_and_tag)
     }
 
     /// Deprecated. Renamed to `seal_in_place_append_tag()`.
